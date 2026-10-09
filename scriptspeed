@@ -1,0 +1,780 @@
+--[[
+    SPEED & JUMP para Delta (Mobile/PC)
+
+    - Sliders táctiles para Velocidad, Salto y Gravedad
+    - Botón flotante ⚡ ON/OFF (toque corto) y arrastrable
+    - Presets rápidos de velocidad
+    - Salto infinito
+    - "Mantener valores": si el juego resetea tu velocidad, la vuelve a poner
+    - Se reaplica solo al reaparecer
+    - Restaura los valores originales al apagar o cerrar
+    - Ajustes guardados por juego (writefile/readfile)
+    - Diseño adaptable a móvil, tamaño de interfaz ajustable
+    - Tecla F7 en PC
+]]
+
+----------------------------------------------------------------
+-- CONFIGURACIÓN
+----------------------------------------------------------------
+local GUI_NAME = "SpeedJumpGUI"
+local FILE     = "SpeedJumpSettings.json" -- Archivo de guardado
+local HOTKEY   = Enum.KeyCode.F7          -- Tecla ON/OFF en PC
+local HEADER_H = 46
+
+-- Límites de los sliders
+local LIMITS = {
+    Speed   = { 0, 250 },
+    Jump    = { 0, 300 },
+    Gravity = { 20, 400 },
+}
+
+-- Colores del tema
+local C = {
+    Bg     = Color3.fromRGB(16, 18, 26),
+    Card   = Color3.fromRGB(28, 31, 43),
+    Btn    = Color3.fromRGB(44, 48, 64),
+    Accent = Color3.fromRGB(90, 130, 255),
+    Green  = Color3.fromRGB(46, 160, 105),
+    Red    = Color3.fromRGB(200, 70, 80),
+    Amber  = Color3.fromRGB(214, 150, 40),
+    Text   = Color3.fromRGB(235, 238, 245),
+    Sub    = Color3.fromRGB(150, 158, 178),
+}
+
+----------------------------------------------------------------
+-- SERVICIOS
+----------------------------------------------------------------
+local Players            = game:GetService("Players")
+local UserInputService   = game:GetService("UserInputService")
+local CoreGui            = game:GetService("CoreGui")
+local HttpService        = game:GetService("HttpService")
+local TweenService       = game:GetService("TweenService")
+local MarketplaceService = game:GetService("MarketplaceService")
+local Workspace          = game:GetService("Workspace")
+
+local player   = Players.LocalPlayer
+local placeKey = tostring(game.PlaceId)
+
+----------------------------------------------------------------
+-- PADRE DE LA GUI + LIMPIEZA
+----------------------------------------------------------------
+local function getGuiParent()
+    local ok, ui = pcall(function() return gethui and gethui() end)
+    if ok and ui then return ui end
+    local ok2 = pcall(function() return CoreGui.Name end)
+    if ok2 then return CoreGui end
+    return player:WaitForChild("PlayerGui")
+end
+
+local guiParent = getGuiParent()
+local old = guiParent:FindFirstChild(GUI_NAME)
+if old then old:Destroy() end
+
+----------------------------------------------------------------
+-- DATOS (por juego)
+----------------------------------------------------------------
+local function clamp(n, lo, hi) return math.max(lo, math.min(hi, n)) end
+
+local function newPlace()
+    return { Speed = 50, Jump = 100, Gravity = 196, InfJump = false, Enforce = true }
+end
+
+local store = { Places = {}, Scale = 100, Alpha = 0 }
+
+pcall(function()
+    if isfile and isfile(FILE) then
+        local data = HttpService:JSONDecode(readfile(FILE))
+        if type(data) == "table" then
+            if type(data.Places) == "table" then store.Places = data.Places end
+            if type(data.Scale) == "number" then store.Scale = data.Scale end
+            if type(data.Alpha) == "number" then store.Alpha = data.Alpha end
+        end
+    end
+end)
+store.Scale = clamp(store.Scale, 70, 150)
+store.Alpha = clamp(store.Alpha, 0, 60)
+
+-- Ajustes de ESTE juego (se completan con valores por defecto si faltan)
+local S = store.Places[placeKey]
+if type(S) ~= "table" then S = {} end
+for k, v in pairs(newPlace()) do
+    if type(S[k]) ~= type(v) then S[k] = v end
+end
+store.Places[placeKey] = S
+
+local function save()
+    pcall(function() writefile(FILE, HttpService:JSONEncode(store)) end)
+end
+
+-- Guardado diferido: evita escribir el archivo en cada movimiento del slider
+local saveQueued = false
+local function saveSoon()
+    if saveQueued then return end
+    saveQueued = true
+    task.delay(1, function()
+        saveQueued = false
+        save()
+    end)
+end
+
+----------------------------------------------------------------
+-- ESTADO
+----------------------------------------------------------------
+local running, enabled, minimized = true, false, false
+local connections, refreshers = {}, {}
+local orig = { Speed = 16, JumpPower = 50, JumpHeight = 7.2, Gravity = Workspace.Gravity }
+local sliderDragging = false
+
+local function track(c) table.insert(connections, c) return c end
+
+----------------------------------------------------------------
+-- HELPERS DE INTERFAZ
+----------------------------------------------------------------
+local function corner(obj, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 10)
+    c.Parent = obj
+end
+
+local function makeStroke(obj, color, transparency, thickness)
+    local s = Instance.new("UIStroke")
+    s.Color = color
+    s.Transparency = transparency or 0
+    s.Thickness = thickness or 1
+    s.Parent = obj
+    return s
+end
+
+local function makeButton(parent, text, size, pos, color)
+    local b = Instance.new("TextButton")
+    b.Size = size
+    b.Position = pos or UDim2.new()
+    b.BackgroundColor3 = color or C.Btn
+    b.Text = text
+    b.TextColor3 = C.Text
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 14
+    b.Parent = parent
+    corner(b, 10)
+    return b
+end
+
+local function makeLabel(parent, text, size, pos, textSize, color)
+    local l = Instance.new("TextLabel")
+    l.Size = size
+    l.Position = pos or UDim2.new()
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.TextColor3 = color or C.Text
+    l.Font = Enum.Font.Gotham
+    l.TextSize = textSize or 14
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextTruncate = Enum.TextTruncate.AtEnd
+    l.Parent = parent
+    return l
+end
+
+local function makeBox(parent, size, pos)
+    local t = Instance.new("TextBox")
+    t.Size = size
+    t.Position = pos
+    t.BackgroundColor3 = C.Btn
+    t.Text = ""
+    t.TextColor3 = C.Text
+    t.Font = Enum.Font.GothamBold
+    t.TextSize = 14
+    t.ClearTextOnFocus = false
+    t.Parent = parent
+    corner(t, 8)
+    return t
+end
+
+-- Arrastrar: handle = zona que se toca, target = lo que se mueve, onTap = acción si fue toque corto
+local function makeDraggable(handle, target, onTap)
+    local dragging, moved, dragStart, startPos = false, false, nil, nil
+    track(handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, moved = true, false
+            dragStart, startPos = input.Position, target.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    if not moved and onTap then onTap() end
+                end
+            end)
+        end
+    end))
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            if d.Magnitude > 6 then moved = true end
+            if moved then
+                target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                                            startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end
+    end))
+end
+
+local function confirmable(btn, idleText, action)
+    local armed = false
+    local idleColor = btn.BackgroundColor3
+    btn.Activated:Connect(function()
+        if not armed then
+            armed = true
+            btn.Text = "¿Seguro?"
+            btn.BackgroundColor3 = C.Red
+            task.delay(2, function()
+                if btn.Parent and armed then
+                    armed = false
+                    btn.Text = idleText
+                    btn.BackgroundColor3 = idleColor
+                end
+            end)
+        else
+            armed = false
+            btn.Text = idleText
+            btn.BackgroundColor3 = idleColor
+            action()
+        end
+    end)
+end
+
+----------------------------------------------------------------
+-- VENTANA
+----------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = GUI_NAME
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = guiParent
+
+local frame = Instance.new("Frame")
+frame.Position = UDim2.new(0, 10, 0, 56)
+frame.BackgroundColor3 = C.Bg
+frame.BorderSizePixel = 0
+frame.ClipsDescendants = true
+frame.Parent = gui
+corner(frame, 16)
+makeStroke(frame, C.Accent, 0.6, 1.5)
+local uiScale = Instance.new("UIScale", frame)
+
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, HEADER_H)
+header.BackgroundColor3 = C.Card
+header.BorderSizePixel = 0
+header.Active = true
+header.Parent = frame
+local grad = Instance.new("UIGradient")
+grad.Color = ColorSequence.new(Color3.fromRGB(60, 80, 160), C.Card)
+grad.Parent = header
+
+makeLabel(header, "⚡ Speed & Jump", UDim2.new(1, -90, 0, 24), UDim2.new(0, 14, 0, 4), 16).Font = Enum.Font.GothamBold
+local subtitle = makeLabel(header, "Juego " .. placeKey, UDim2.new(1, -90, 0, 16), UDim2.new(0, 14, 0, 26), 11, C.Sub)
+
+local minBtn   = makeButton(header, "–", UDim2.fromOffset(32, 32), UDim2.new(1, -78, 0.5, -16))
+local closeBtn = makeButton(header, "✕", UDim2.fromOffset(32, 32), UDim2.new(1, -40, 0.5, -16), C.Red)
+
+local body = Instance.new("Frame")
+body.Size = UDim2.new(1, 0, 1, -HEADER_H)
+body.Position = UDim2.new(0, 0, 0, HEADER_H)
+body.BackgroundTransparency = 1
+body.Parent = frame
+
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, -16, 0, 38)
+tabBar.Position = UDim2.new(0, 8, 0, 8)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = body
+local tabLayout = Instance.new("UIListLayout")
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.Padding = UDim.new(0, 6)
+tabLayout.Parent = tabBar
+
+local content = Instance.new("Frame")
+content.Size = UDim2.new(1, -16, 1, -62)
+content.Position = UDim2.new(0, 8, 0, 54)
+content.BackgroundTransparency = 1
+content.Parent = body
+
+local function newPage()
+    local p = Instance.new("Frame")
+    p.Size = UDim2.new(1, 0, 1, 0)
+    p.BackgroundTransparency = 1
+    p.Visible = false
+    p.Parent = content
+    return p
+end
+
+local function newScroll(parent)
+    local s = Instance.new("ScrollingFrame")
+    s.Size = UDim2.new(1, 0, 1, 0)
+    s.BackgroundTransparency = 1
+    s.BorderSizePixel = 0
+    s.ScrollBarThickness = 3
+    s.ScrollBarImageColor3 = C.Accent
+    s.CanvasSize = UDim2.new()
+    s.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    s.ScrollingDirection = Enum.ScrollingDirection.Y
+    s.Parent = parent
+    local l = Instance.new("UIListLayout")
+    l.Padding = UDim.new(0, 6)
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    l.Parent = s
+    local pad = Instance.new("UIPadding", s)
+    pad.PaddingRight = UDim.new(0, 6)
+    pad.PaddingBottom = UDim.new(0, 6)
+    return s
+end
+
+local pageMove, pageSet = newPage(), newPage()
+local tabs = {}
+
+local function selectTab(i)
+    for idx, t in ipairs(tabs) do
+        t.page.Visible = (idx == i)
+        t.btn.BackgroundColor3 = (idx == i) and C.Accent or C.Card
+        t.btn.TextColor3 = (idx == i) and Color3.fromRGB(255, 255, 255) or C.Sub
+    end
+end
+
+local function addTab(text, page)
+    local b = makeButton(tabBar, text, UDim2.new(0.5, -3, 1, 0), nil, C.Card)
+    b.TextSize = 13
+    table.insert(tabs, { btn = b, page = page })
+    local idx = #tabs
+    b.Activated:Connect(function() selectTab(idx) end)
+end
+addTab("⚡ Movimiento", pageMove)
+addTab("⚙ Ajustes", pageSet)
+
+local scrollMove = newScroll(pageMove)
+local scrollSet  = newScroll(pageSet)
+
+----------------------------------------------------------------
+-- AVISOS FLOTANTES
+----------------------------------------------------------------
+local toastLabel = Instance.new("TextLabel")
+toastLabel.AnchorPoint = Vector2.new(0.5, 1)
+toastLabel.Position = UDim2.new(0.5, 0, 1, -28)
+toastLabel.Size = UDim2.fromOffset(0, 36)
+toastLabel.AutomaticSize = Enum.AutomaticSize.X
+toastLabel.BackgroundColor3 = C.Bg
+toastLabel.BackgroundTransparency = 1
+toastLabel.TextTransparency = 1
+toastLabel.TextColor3 = C.Text
+toastLabel.Font = Enum.Font.GothamBold
+toastLabel.TextSize = 14
+toastLabel.ZIndex = 50
+toastLabel.Parent = gui
+corner(toastLabel, 18)
+local toastPad = Instance.new("UIPadding", toastLabel)
+toastPad.PaddingLeft, toastPad.PaddingRight = UDim.new(0, 18), UDim.new(0, 18)
+local toastStroke = makeStroke(toastLabel, C.Accent, 1, 1.5)
+
+local toastToken = 0
+local function toast(text)
+    toastToken += 1
+    local my = toastToken
+    toastLabel.Text = text
+    local info = TweenInfo.new(0.2)
+    TweenService:Create(toastLabel, info, { BackgroundTransparency = 0.1, TextTransparency = 0 }):Play()
+    TweenService:Create(toastStroke, info, { Transparency = 0.2 }):Play()
+    task.delay(2.2, function()
+        if toastToken == my and toastLabel.Parent then
+            TweenService:Create(toastLabel, info, { BackgroundTransparency = 1, TextTransparency = 1 }):Play()
+            TweenService:Create(toastStroke, info, { Transparency = 1 }):Play()
+        end
+    end)
+end
+
+----------------------------------------------------------------
+-- BOTÓN FLOTANTE (toque corto = ON/OFF, arrastrar = mover)
+----------------------------------------------------------------
+local floatBtn = Instance.new("TextButton")
+floatBtn.Size = UDim2.fromOffset(52, 52)
+floatBtn.Position = UDim2.new(1, -68, 0.6, 0)
+floatBtn.BackgroundColor3 = C.Red
+floatBtn.Text = "⚡"
+floatBtn.TextSize = 24
+floatBtn.Font = Enum.Font.GothamBold
+floatBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+floatBtn.AutoButtonColor = false
+floatBtn.ZIndex = 20
+floatBtn.Parent = gui
+corner(floatBtn, 26)
+makeStroke(floatBtn, Color3.fromRGB(255, 255, 255), 0.2, 2)
+
+----------------------------------------------------------------
+-- LÓGICA: aplicar velocidad / salto / gravedad
+----------------------------------------------------------------
+local function getHum()
+    local char = player.Character
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+-- JumpHeight equivalente a un JumpPower (para personajes que usan altura)
+local function powerToHeight(p)
+    return p * p / (2 * Workspace.Gravity)
+end
+
+local function close(a, b) return math.abs(a - b) < 0.01 end
+
+local function applyAll()
+    local hum = getHum()
+    if enabled then
+        Workspace.Gravity = S.Gravity
+        if hum then
+            hum.WalkSpeed = S.Speed
+            if hum.UseJumpPower then
+                hum.JumpPower = S.Jump
+            else
+                hum.JumpHeight = powerToHeight(S.Jump)
+            end
+        end
+    else
+        Workspace.Gravity = orig.Gravity
+        if hum then
+            hum.WalkSpeed = orig.Speed
+            if hum.UseJumpPower then
+                hum.JumpPower = orig.JumpPower
+            else
+                hum.JumpHeight = orig.JumpHeight
+            end
+        end
+    end
+end
+
+local function refreshToggle()
+    floatBtn.BackgroundColor3 = enabled and C.Green or C.Red
+    for _, f in ipairs(refreshers) do f() end
+end
+
+local function setEnabled(v)
+    if not running then return end
+    enabled = v
+    applyAll()
+    refreshToggle()
+    toast(enabled and "⚡ Activado" or "Desactivado (valores originales)")
+end
+
+-- Engancha un humanoide: guarda sus valores originales y evita que el juego los resetee
+local function hookHumanoid(hum)
+    -- Al reaparecer, el humanoide trae sus valores originales
+    orig.Speed = hum.WalkSpeed
+    orig.JumpPower = hum.JumpPower
+    orig.JumpHeight = hum.JumpHeight
+
+    local function guard(prop, want)
+        track(hum:GetPropertyChangedSignal(prop):Connect(function()
+            if running and enabled and S.Enforce then
+                local target = want()
+                if target and not close(hum[prop], target) then hum[prop] = target end
+            end
+        end))
+    end
+    guard("WalkSpeed", function() return S.Speed end)
+    guard("JumpPower", function() return hum.UseJumpPower and S.Jump or nil end)
+    guard("JumpHeight", function() return (not hum.UseJumpPower) and powerToHeight(S.Jump) or nil end)
+
+    if enabled then applyAll() end
+end
+
+local function onCharacter(char)
+    local hum = char:WaitForChild("Humanoid", 10)
+    if hum and running then hookHumanoid(hum) end
+end
+
+track(player.CharacterAdded:Connect(function(char) task.spawn(onCharacter, char) end))
+if player.Character then task.spawn(onCharacter, player.Character) end
+
+-- Mantener la gravedad si el juego la cambia
+track(Workspace:GetPropertyChangedSignal("Gravity"):Connect(function()
+    if running and enabled and S.Enforce and not close(Workspace.Gravity, S.Gravity) then
+        Workspace.Gravity = S.Gravity
+    end
+end))
+
+-- Salto infinito
+track(UserInputService.JumpRequest:Connect(function()
+    if enabled and S.InfJump then
+        local hum = getHum()
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end))
+
+-- Tecla rápida (PC)
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if not processed and input.KeyCode == HOTKEY then setEnabled(not enabled) end
+end))
+
+----------------------------------------------------------------
+-- CONTROLES
+----------------------------------------------------------------
+local order = 0
+local function nextOrder() order += 1 return order end
+
+local function card(parent, height)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, 0, 0, height)
+    f.BackgroundColor3 = C.Card
+    f.LayoutOrder = nextOrder()
+    f.Parent = parent
+    corner(f, 12)
+    return f
+end
+
+-- Slider táctil: arrastra la barra o escribe el valor
+local function addSlider(text, key)
+    local mn, mx = LIMITS[key][1], LIMITS[key][2]
+    local row = card(scrollMove, 70)
+
+    makeLabel(row, text, UDim2.new(1, -90, 0, 24), UDim2.new(0, 12, 0, 6), 14).Font = Enum.Font.GothamBold
+    local box = makeBox(row, UDim2.fromOffset(64, 28), UDim2.new(1, -76, 0, 6))
+
+    -- Zona táctil alta para que sea fácil de usar con el dedo
+    local hit = Instance.new("TextButton")
+    hit.Size = UDim2.new(1, -24, 0, 30)
+    hit.Position = UDim2.new(0, 12, 0, 34)
+    hit.BackgroundTransparency = 1
+    hit.Text = ""
+    hit.AutoButtonColor = false
+    hit.Parent = row
+
+    local track_ = Instance.new("Frame")
+    track_.Size = UDim2.new(1, 0, 0, 8)
+    track_.Position = UDim2.new(0, 0, 0.5, -4)
+    track_.BackgroundColor3 = C.Btn
+    track_.BorderSizePixel = 0
+    track_.Parent = hit
+    corner(track_, 4)
+
+    local fill = Instance.new("Frame")
+    fill.BackgroundColor3 = C.Accent
+    fill.BorderSizePixel = 0
+    fill.Parent = track_
+    corner(fill, 4)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(24, 24)
+    knob.AnchorPoint = Vector2.new(0.5, 0.5)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.BorderSizePixel = 0
+    knob.ZIndex = 2
+    knob.Parent = track_
+    corner(knob, 12)
+
+    local function show()
+        local a = (S[key] - mn) / (mx - mn)
+        fill.Size = UDim2.new(a, 0, 1, 0)
+        knob.Position = UDim2.new(a, 0, 0.5, 0)
+        box.Text = tostring(S[key])
+    end
+
+    local function setValue(v)
+        S[key] = clamp(math.floor(v + 0.5), mn, mx)
+        show()
+        if enabled then applyAll() end
+        saveSoon()
+    end
+
+    local dragging = false
+    local function fromInput(input)
+        local w = track_.AbsoluteSize.X
+        if w <= 0 then return end
+        local a = clamp((input.Position.X - track_.AbsolutePosition.X) / w, 0, 1)
+        setValue(mn + a * (mx - mn))
+    end
+
+    hit.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            sliderDragging = true
+            scrollMove.ScrollingEnabled = false -- evita que la lista se mueva mientras arrastras
+            fromInput(input)
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    sliderDragging = false
+                    scrollMove.ScrollingEnabled = true
+                end
+            end)
+        end
+    end)
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            fromInput(input)
+        end
+    end))
+
+    box.FocusLost:Connect(function() setValue(tonumber(box.Text) or S[key]) end)
+    table.insert(refreshers, show)
+    show()
+    return setValue
+end
+
+local function addToggle(parent, text, key, hint)
+    local b = makeButton(parent, "", UDim2.new(1, 0, 0, 44), nil, C.Btn)
+    b.LayoutOrder = nextOrder()
+    local function r()
+        b.Text = text .. ":  " .. (S[key] and "SÍ" or "NO")
+        b.BackgroundColor3 = S[key] and C.Green or C.Btn
+    end
+    b.Activated:Connect(function()
+        S[key] = not S[key]
+        r()
+        saveSoon()
+    end)
+    table.insert(refreshers, r)
+    r()
+    return b
+end
+
+-- Botón principal ON/OFF
+local mainBtn = makeButton(scrollMove, "", UDim2.new(1, 0, 0, 52), nil, C.Red)
+mainBtn.LayoutOrder = nextOrder()
+mainBtn.TextSize = 17
+mainBtn.Activated:Connect(function() setEnabled(not enabled) end)
+table.insert(refreshers, function()
+    mainBtn.Text = enabled and "⚡  ACTIVADO" or "⚡  DESACTIVADO"
+    mainBtn.BackgroundColor3 = enabled and C.Green or C.Red
+end)
+
+-- Sliders
+local setSpeed = addSlider("🏃 Velocidad", "Speed")
+addSlider("🦘 Salto", "Jump")
+addSlider("🌍 Gravedad", "Gravity")
+
+-- Presets de velocidad
+local presetCard = card(scrollMove, 76)
+makeLabel(presetCard, "Velocidad rápida", UDim2.new(1, -24, 0, 20), UDim2.new(0, 12, 0, 6), 12, C.Sub)
+local presets = { 16, 32, 50, 100 }
+for i, v in ipairs(presets) do
+    local b = makeButton(presetCard, tostring(v), UDim2.new(0.25, -8, 0, 36), UDim2.new((i - 1) * 0.25, i == 1 and 12 or 4, 0, 32), C.Btn)
+    b.Size = UDim2.new(0.25, -6, 0, 36)
+    b.Position = UDim2.new((i - 1) * 0.25, 6, 0, 32)
+    b.Activated:Connect(function() setSpeed(v) end)
+end
+
+addToggle(scrollMove, "Salto infinito", "InfJump")
+addToggle(scrollMove, "Mantener valores", "Enforce")
+
+local restoreBtn = makeButton(scrollMove, "Restaurar valores originales", UDim2.new(1, 0, 0, 44), nil, C.Amber)
+restoreBtn.LayoutOrder = nextOrder()
+restoreBtn.Activated:Connect(function()
+    if enabled then setEnabled(false) else applyAll() toast("Valores originales") end
+end)
+
+local note = makeLabel(scrollMove,
+    "Tip: si el juego te devuelve a la velocidad normal, activa «Mantener valores».",
+    UDim2.new(1, 0, 0, 40), nil, 11, C.Sub)
+note.TextWrapped = true
+note.TextTruncate = Enum.TextTruncate.None
+note.TextYAlignment = Enum.TextYAlignment.Top
+note.LayoutOrder = nextOrder()
+
+----------------------------------------------------------------
+-- AJUSTES
+----------------------------------------------------------------
+local layoutFrame -- se define abajo
+order = 0
+
+local function addStepper(text, get, set, mn, mx, step, suffix)
+    local row = card(scrollSet, 48)
+    makeLabel(row, text, UDim2.new(1, -160, 1, 0), UDim2.new(0, 12, 0, 0), 13)
+    local minus = makeButton(row, "–", UDim2.fromOffset(40, 36), UDim2.new(1, -152, 0.5, -18))
+    local val = makeLabel(row, "", UDim2.fromOffset(56, 36), UDim2.new(1, -108, 0.5, -18), 13)
+    val.TextXAlignment = Enum.TextXAlignment.Center
+    val.Font = Enum.Font.GothamBold
+    local plus = makeButton(row, "+", UDim2.fromOffset(40, 36), UDim2.new(1, -48, 0.5, -18))
+    local function refresh() val.Text = tostring(get()) .. suffix end
+    local function change(d) set(clamp(get() + d, mn, mx)) refresh() saveSoon() end
+    minus.Activated:Connect(function() change(-step) end)
+    plus.Activated:Connect(function() change(step) end)
+    refresh()
+end
+
+addStepper("Tamaño de interfaz", function() return store.Scale end,
+    function(v) store.Scale = v layoutFrame() end, 70, 150, 10, "%")
+addStepper("Transparencia", function() return store.Alpha end,
+    function(v) store.Alpha = v frame.BackgroundTransparency = v / 100 end, 0, 60, 10, "%")
+
+local delBtn = makeButton(scrollSet, "Borrar datos de este juego", UDim2.new(1, 0, 0, 44), nil, C.Btn)
+delBtn.LayoutOrder = nextOrder()
+confirmable(delBtn, "Borrar datos de este juego", function()
+    local d = newPlace()
+    for k, v in pairs(d) do S[k] = v end
+    if enabled then applyAll() end
+    for _, f in ipairs(refreshers) do f() end
+    save()
+    toast("Datos del juego restablecidos")
+end)
+
+local canSave = (writefile ~= nil and readfile ~= nil)
+local info = makeLabel(scrollSet,
+    canSave and "💾 Tus valores se guardan por juego automáticamente."
+    or "⚠ Tu ejecutor no soporta writefile/readfile: los valores no se guardarán al cerrar.",
+    UDim2.new(1, 0, 0, 44), nil, 12, canSave and C.Sub or C.Amber)
+info.TextWrapped = true
+info.TextTruncate = Enum.TextTruncate.None
+info.TextYAlignment = Enum.TextYAlignment.Top
+info.LayoutOrder = nextOrder()
+
+----------------------------------------------------------------
+-- DISEÑO ADAPTABLE (móvil / PC)
+----------------------------------------------------------------
+function layoutFrame()
+    local cam = Workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+    local sc = store.Scale / 100
+    uiScale.Scale = sc
+    local w = clamp(vp.X * 0.92 / sc, 250, 340)
+    local h = clamp(vp.Y * 0.80 / sc, 230, 480)
+    frame.Size = minimized and UDim2.fromOffset(w, HEADER_H) or UDim2.fromOffset(w, h)
+end
+
+do
+    local cam = Workspace.CurrentCamera
+    if cam then track(cam:GetPropertyChangedSignal("ViewportSize"):Connect(layoutFrame)) end
+end
+
+minBtn.Activated:Connect(function()
+    minimized = not minimized
+    body.Visible = not minimized
+    minBtn.Text = minimized and "+" or "–"
+    layoutFrame()
+end)
+
+makeDraggable(header, frame)
+makeDraggable(floatBtn, floatBtn, function() setEnabled(not enabled) end)
+
+closeBtn.Activated:Connect(function()
+    running = false
+    enabled = false
+    applyAll() -- devuelve velocidad, salto y gravedad originales
+    save()
+    for _, c in ipairs(connections) do c:Disconnect() end
+    gui:Destroy()
+end)
+
+----------------------------------------------------------------
+-- INICIO
+----------------------------------------------------------------
+frame.BackgroundTransparency = store.Alpha / 100
+layoutFrame()
+selectTab(1)
+refreshToggle()
+toast("⚡ Listo. Pulsa el botón ⚡ para activar")
+
+-- Nombre real del juego
+task.spawn(function()
+    local ok, info_ = pcall(function() return MarketplaceService:GetProductInfo(game.PlaceId) end)
+    if ok and type(info_) == "table" and type(info_.Name) == "string" and running then
+        subtitle.Text = info_.Name
+    end
+end)
